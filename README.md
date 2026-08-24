@@ -1,216 +1,237 @@
 # Clinic Booking API
 
-A small clinic, 5 doctors, 30-minute appointment slots. Patients look up a doctor's
-free slots for a given day, book one, and can cancel or reschedule later. That's the
-whole scope — this README walks through how it's modeled, how the API behaves, how to
-run it, and how it's deployed.
+A small clinic with 5 doctors and 30-minute appointment slots. Patients can look up a doctor's free slots for a given day, book one, and later cancel or reschedule it. That's the scope of the system.
+
+**Repository:** https://github.com/NgeruSK/Tech-Support-Engineer-Assessment-Clinic-Booking-System  
+**Live API:** https://tech-support-engineer-assessment-clinic.onrender.com/  
+**Swagger Docs:** https://tech-support-engineer-assessment-clinic.onrender.com/docs
+
+---
 
 ## Section 1 — System design
 
-Three models cover it: **Doctor** (`name`, `specialty`, `phone_number`, `work_start`,
-`work_end`), **Patient** (`name`, `email`, `phone_number`), and **Appointment**
-(`doctor_id`, `patient_id`, `start_time`, `end_time`, `status`, `cancellation_reason`).
-Phone numbers are plain strings, no format validation — good enough for a clinic
-that needs a number to call, not something that needs to reject malformed input at
-the API boundary. The doctors are a fixed roster of 5, seeded on startup rather than
-created through the API — the brief describes a clinic that already has 5 doctors, it
-doesn't ask for a way to add more, so I didn't build one. Patients aren't created
-through a separate signup step either; `POST /appointments` takes a name, email, and
-phone number and gets-or-creates the patient behind the scenes, updating the stored
-name/phone if they've changed since the last booking. There's no login. That's fine
-for a take-home, but it does mean `GET /patients/{id}/appointments` is reachable by
-anyone who knows the ID — a real version of this needs auth in front of it before that
-endpoint goes anywhere near production.
+Three models cover it: **Doctor** (`name`, `specialty`, `phone_number`, `work_start`, `work_end`), **Patient** (`name`, `email`, `phone_number`), and **Appointment** (`doctor_id`, `patient_id`, `start_time`, `end_time`, `status`, `cancellation_reason`).
 
-I didn't add a "Slot" table. Availability for a doctor on a date is computed each time
-it's asked for: walk from `work_start` to `work_end` in 30-minute steps, drop the ones
-that already have a booked appointment. Keeping a slots table in sync as doctors'
-hours change felt like more moving parts than the problem needed — recomputing a day's
-worth of slots is cheap, and there's nothing to expire or regenerate.
+Phone numbers are stored as plain strings without format validation. The doctors are a fixed roster of 5, seeded on startup rather than created through the API. The brief describes an existing clinic with 5 doctors and doesn't require doctor management, so I kept that part simple.
 
-Working hours are one window per doctor, applied every day of the week. Real clinics
-have different hours on different days and take time off, obviously, but that's a
-schema change (a `DoctorSchedule` table keyed by weekday) rather than a rewrite of the
-booking logic — the function that generates a day's slots doesn't care where the hours
-come from.
+Patients aren't created through a separate signup step. `POST /appointments` takes the patient's name, email and phone number and gets-or-creates the patient behind the scenes. Email identifies an existing patient, while name and phone are updated if they change.
 
-One thing I want to be upfront about rather than gloss over: booking conflicts are
-caught by re-checking for an existing appointment at write time, not by a database
-constraint. That's fine under SQLite with one worker process, which is what this runs
-as, but it's not race-proof — two simultaneous requests for the same slot on a real
-multi-worker deployment could both slip through. The actual fix is a unique index on
-`(doctor_id, start_time)` scoped to booked appointments. I didn't add it because
-SQLite doesn't get much value from it and it would need to move with the eventual
-Postgres migration anyway, but a reviewer should know the gap is there rather than
-assume it's handled.
+There is no authentication, since it isn't part of the assessment scope.
 
-A few smaller calls: cancelling never deletes the row (status flips to `cancelled`,
-reason gets stored) — otherwise there's no way to reject a second cancel with a
-sensible error, and you lose the audit trail for free. Times are naive UTC throughout,
-no timezone awareness — reasonable for one location, would need revisiting for a
-multi-branch clinic. And the DB is SQLite by default purely because it's zero setup;
-swapping to Postgres later is a one-line `DATABASE_URL` change since nothing in the
-models or the booking logic touches SQLite specifically.
+I didn't add a separate `Slot` table. Availability is calculated when requested by walking from `work_start` to `work_end` in 30-minute steps and removing slots that already have an active appointment. For a small clinic, this is simpler than maintaining a separate set of slot records.
 
-Code is split so the booking rules don't know FastAPI exists:
+Working hours are one window per doctor and apply every day of the week. A real clinic would likely need different hours by weekday, holidays and doctor leave. That could be added later with a `DoctorSchedule` model without changing the core booking logic.
 
-```
+One limitation worth noting is concurrent booking. The service checks for an existing appointment at write time rather than relying on a database constraint. This is sufficient for the current single-process SQLite deployment, but it is not fully race-proof under multiple workers. A production version would add database-level protection, such as a unique constraint/index for the doctor and appointment start time.
+
+Cancelled appointments are not deleted. Their status changes to `cancelled` and the cancellation reason is stored. This keeps the history while making the slot available again.
+
+Times are stored as naive UTC datetimes. This keeps things simple for the single-location scenario, but timezone-aware datetimes would be more appropriate for a multi-location system.
+
+SQLite is used by default because it requires no setup. The application uses SQLAlchemy and does not depend on SQLite-specific booking logic, so moving to PostgreSQL later is straightforward.
+
+The code is split so the booking rules don't depend directly on FastAPI:
+
+```text
 app/
-  main.py                  FastAPI app, startup seeding, maps domain errors to HTTP status codes
+  main.py                  FastAPI app, startup seeding and HTTP error handling
   database.py              SQLAlchemy engine/session
   models.py                ORM models
-  schemas.py               Pydantic request/response bodies
+  schemas.py               Pydantic request/response models
   seed.py                  the 5 doctors
-  services/booking.py      the actual rules — slot generation, validation, cancel/reschedule
-  routers/                 parses the request, calls the service, returns the result
-tests/                     pytest against the booking rules
+  services/booking.py      booking rules, validation, cancel/reschedule
+  routers/                 API routes
+
+tests/                     pytest tests
 ```
 
-`services/booking.py` takes a DB session and plain values, and raises its own
-exceptions (`NotFoundError`, `ValidationError`, `ConflictError`, `AlreadyCancelledError`)
-instead of anything FastAPI-specific. `main.py` catches those and turns them into 404 /
-400 / 409 responses in one place. Routers end up being a few lines each.
+`services/booking.py` raises its own exceptions (`NotFoundError`, `ValidationError`, `ConflictError`, `AlreadyCancelledError`) rather than FastAPI-specific exceptions. `main.py` maps these to the appropriate HTTP responses, keeping the business logic separate from the API layer.
 
 ### Assumptions
 
-Most of these are already explained above, in context — this is the same list
-gathered in one place so nothing's buried in a paragraph:
+- Exactly 5 doctors, fixed and seeded at startup.
+- One working-hours window per doctor, applied every day.
+- Slots are always 30 minutes.
+- Datetimes are treated as naive UTC.
+- No authentication is implemented.
+- Patients are identified by email when booking.
+- Phone numbers are stored without format validation.
+- No SMS or email notifications are sent.
+- The server's UTC clock is authoritative for "now".
+- The 1-hour lead-time restriction is calculated using server UTC time.
+- SQLite is the default database.
+- The current deployment assumes a single application process.
 
-- Exactly 5 doctors, fixed at startup. Nothing creates, edits, or removes one — the
-  roster in `app/seed.py` is the whole roster.
-- One working-hours window per doctor, applied every day of the week. No days off, no
-  per-weekday hours, no holidays.
-- Slots are always exactly 30 minutes — not configurable per doctor or appointment type.
-- All datetimes are naive UTC. `start_time` in a request is taken as UTC as-is; there's
-  no timezone field and no conversion. Whatever timezone a client is actually in, it's
-  on them to send UTC.
-- No authentication anywhere. Any client can book, cancel, reschedule, or read any
-  patient's upcoming appointments given the right ID.
-- A patient is identified by email, not by an ID a client would already have. Booking
-  with an email seen before reuses that patient record and overwrites the stored
-  name/phone with whatever was sent this time.
-- Phone numbers are unvalidated strings — no format check, no country-code enforcement.
-- Nothing is actually sent anywhere. Phone numbers and emails are stored, not acted on
-  — no SMS/email confirmation, reminder, or cancellation notice exists. Collecting
-  contact info and doing something with it are two different features; only the first
-  is built.
-- Single-process deployment. The no-double-booking check is a re-check at write time,
-  not a database constraint — safe under one worker, not guaranteed under several (see
-  the concurrency note above).
-- The server's own clock is authoritative for "now." The past-booking check and the
-  1-hour lead-time buffer both compare against server UTC time, not anything a client
-  claims the current time is.
+---
 
 ## Section 2 — API implementation
 
 | Method | Path | What it does |
 |---|---|---|
-| `GET` | `/doctors` | List doctors — name, specialty, phone number, working hours |
-| `GET` | `/doctors/{id}/availability?date=YYYY-MM-DD` | Free 30-min slots for a doctor on a date |
-| `POST` | `/appointments` | Book a slot — `doctor_id`, `patient_name`, `patient_email`, `patient_phone`, `start_time` |
-| `PATCH` | `/appointments/{id}/cancel` | Cancel with a `reason`; 400 if already cancelled |
-| `PATCH` | `/appointments/{id}/reschedule` | Move to a new `start_time`, validated like a fresh booking; 400 if cancelled |
-| `GET` | `/patients/{id}/appointments` | Bonus — upcoming appointments, sorted by date |
-| `GET` | `/` | Landing route — service name and pointers to `/docs` and `/health` |
+| `GET` | `/doctors` | List doctors — name, specialty, phone number and working hours |
+| `GET` | `/doctors/{id}/availability?date=YYYY-MM-DD` | Free 30-minute slots for a doctor |
+| `POST` | `/appointments` | Book an appointment |
+| `PATCH` | `/appointments/{id}/cancel` | Cancel with a reason |
+| `PATCH` | `/appointments/{id}/reschedule` | Move an appointment to a new slot |
+| `GET` | `/patients/{id}/appointments` | Bonus — upcoming appointments sorted by date |
+| `GET` | `/` | Basic landing route |
 | `GET` | `/health` | Liveness check |
 
-`GET /doctors` isn't in the original brief, but it's what makes a doctor's phone
-number actually reachable — a patient picking who to book with needs to see the
-roster (and be able to call ahead) before hitting the availability endpoint.
+`GET /doctors` is an additional endpoint that makes the fixed doctor roster available to clients before they request availability.
 
-`/docs` gets you Swagger, generated automatically, for poking at this by hand.
+`/docs` provides FastAPI's automatically generated Swagger documentation.
 
-Errors come back as `{"detail": "..."}` with a status that actually means something:
-400 for anything that fails a booking rule (outside working hours, not aligned to the
-30-minute grid, in the past, inside the 1-hour lead-time buffer, already
-cancelled, rescheduling something cancelled), 404 when the doctor/patient/appointment
-doesn't exist, 409 specifically for "someone already has this slot."
+Booking validates that the doctor exists, the requested time is within working hours, starts on a 30-minute boundary, is not in the past, is at least 1 hour away, and is not already booked.
 
-A few example calls:
+Cancellation changes the appointment status to `cancelled` and stores the reason. The slot then becomes available again. A second cancellation returns an error.
+
+Rescheduling validates the new slot in the same way as a fresh booking. A cancelled appointment cannot be rescheduled.
+
+Errors use meaningful HTTP status codes:
+
+- `400` for booking/validation rules
+- `404` when a doctor, patient or appointment does not exist
+- `409` when the requested slot is already booked
+
+Example calls:
 
 ```bash
 curl "http://localhost:8000/doctors"
 
 curl "http://localhost:8000/doctors/1/availability?date=2026-08-25"
 
-curl -X POST http://localhost:8000/appointments \
+curl -X POST "http://localhost:8000/appointments" \
   -H "Content-Type: application/json" \
   -d '{"doctor_id":1,"patient_name":"Jane Doe","patient_email":"jane@example.com","patient_phone":"+254712345678","start_time":"2026-08-25T09:00:00"}'
 
-curl -X PATCH http://localhost:8000/appointments/1/cancel \
-  -H "Content-Type: application/json" -d '{"reason":"Feeling better"}'
+curl -X PATCH "http://localhost:8000/appointments/1/cancel" \
+  -H "Content-Type: application/json" \
+  -d '{"reason":"Feeling better"}'
 
-curl -X PATCH http://localhost:8000/appointments/1/reschedule \
-  -H "Content-Type: application/json" -d '{"start_time":"2026-08-25T10:00:00"}'
+curl -X PATCH "http://localhost:8000/appointments/1/reschedule" \
+  -H "Content-Type: application/json" \
+  -d '{"start_time":"2026-08-25T10:00:00"}'
 
 curl "http://localhost:8000/patients/1/appointments"
 ```
 
+---
+
 ## Running it locally
 
-Needs Python 3.11+ (built and tested on 3.13). Nothing else — no external database,
-no API keys, no `.env` file.
+Requires Python 3.11+ (built and tested on Python 3.13). No external database, API keys or `.env` file are required.
 
 ```bash
 python3 -m venv .venv
-source .venv/bin/activate          # Windows: .venv\Scripts\activate
+
+source .venv/bin/activate
+# Windows: .venv\Scripts\activate
+
 pip install -r requirements-dev.txt
+
 uvicorn app.main:app --reload
 ```
 
-`DATABASE_URL` defaults to `sqlite:///./clinic.db`, and the 5 doctors seed themselves
-into it on first startup — delete `clinic.db` any time you want a clean slate. The
-server listens on `http://localhost:8000`; Swagger docs live at
-`http://localhost:8000/docs`.
+The server runs at `http://localhost:8000`.
 
-`requirements-dev.txt` pulls in `requirements.txt` plus the test dependencies (pytest,
-httpx, time-machine). If you only want to run the server and don't care about running
-tests, `pip install -r requirements.txt` on its own is enough.
+Swagger is available at `http://localhost:8000/docs`.
 
-Docker works the same way, on the same port:
+`DATABASE_URL` defaults to:
+
+```text
+sqlite:///./clinic.db
+```
+
+The 5 doctors are seeded on startup. Delete `clinic.db` to start with a clean database.
+
+If tests are not needed, `requirements.txt` is enough:
+
+```bash
+pip install -r requirements.txt
+```
+
+Docker:
 
 ```bash
 docker build -t clinic-booking-api .
+
 docker run -p 8000:8000 clinic-booking-api
 ```
+
+---
 
 ## Testing
 
 ```bash
 pip install -r requirements-dev.txt
+
 pytest -v
 ```
 
-Runs against an in-memory SQLite DB (`tests/conftest.py` sets `DATABASE_URL` before
-anything else imports). Time-sensitive rules — the past-booking check, the 1-hour
-buffer — are tested with [`time-machine`](https://github.com/adamchainz/time-machine)
-pinning "now" explicitly in UTC, rather than relying on whatever the clock happens to
-say when the suite runs. (Worth reading Section 4 below — that library choice wasn't
-the first one I tried, and the reason it changed is a decent story.)
+Tests use an in-memory SQLite database.
 
-Coverage: the doctor listing, booking success, double-booking, outside working hours,
-off the 30-minute grid, in the past, inside the 1-hour window, cancel, double-cancel,
-reschedule (including into an already-taken slot, and rescheduling something
-cancelled), availability correctly reflecting bookings/cancellations, and the patient-appointments
-endpoint.
+Time-sensitive rules, including the past-booking check and 1-hour lead-time restriction, are tested with `time-machine` so the current time can be controlled explicitly rather than depending on the actual system clock.
+
+Coverage includes successful bookings, double booking, working-hours validation, 30-minute slot validation, past bookings, the 1-hour restriction, cancellation, double cancellation, rescheduling, occupied reschedule slots, cancelled appointments, availability after booking/cancellation, and upcoming patient appointments.
+
+---
 
 ## Section 3 — Deployment & CI/CD
 
-Deploying to [Render](https://render.com) as a Docker web service — `render.yaml`
-describes the service, the `Dockerfile` builds it. Public URL: *to be filled in once
-the repo is connected.* Any host that takes a Dockerfile and gives you a webhook to
-trigger a redeploy (Railway, Fly.io) would work identically here — nothing in the
-pipeline is Render-specific except the one `curl` target.
+The application is deployed on [Render](https://render.com/) as a Docker web service.
 
-`main` is the branch that matters. The GitHub Actions workflow (`.github/workflows/ci.yml`)
-has two jobs. `test` runs on every PR into `main` and every push to `main` — installs
-deps, runs pytest, and that's the actual gate if branch protection is turned on.
-`deploy` only runs on a push to `main`, only after `test` passes, and it just hits a
-Render deploy hook URL stored as a repo secret (`RENDER_DEPLOY_HOOK_URL`).
+**Live URL:** https://tech-support-engineer-assessment-clinic.onrender.com/
 
-To turn deployment on: spin up the Render service from `render.yaml`, grab the deploy
-hook URL from its dashboard, add it as that GitHub secret. Without the secret, `test`
-still runs and still gates PRs — `deploy` just fails loudly instead of silently doing
-nothing, which felt like the safer default.
+The service is connected to the GitHub repository:
 
+https://github.com/NgeruSK/Tech-Support-Engineer-Assessment-Clinic-Booking-System
 
+`render.yaml` describes the Render service and the `Dockerfile` builds the application.
+
+`main` is the deployment branch.
+
+GitHub Actions runs the test suite on every pull request into `main` and on pushes to `main`.
+
+Once changes are merged into `main`, Render's Git integration automatically detects the change and deploys the latest version.
+
+The flow is:
+
+```text
+Pull Request → Tests → Merge to main → Render deployment
+```
+
+The GitHub Actions workflow also contains a Render deploy-hook step. With Render's native Git deployment enabled, this is redundant for the current setup, but it provides a fallback if the deployment approach is changed later.
+
+---
+
+## Section 4 — AI Reflection
+
+### 1. What did you use AI for across the four sections?
+
+- **Section 1:** Reviewing system design, data models, assumptions and trade-offs.
+- **Section 2:** Assisting with API structure, validation rules, edge cases and tests.
+- **Section 3:** Reviewing Docker and GitHub Actions CI/CD configuration.
+- **Overall:** Reviewing code, identifying possible issues and suggesting improvements.
+
+AI was used as a development and review tool, while the application and tests were run and verified independently.
+
+### 2. One example where AI improved my work
+
+I used AI to help identify a reliable way to test the time-based booking rules, particularly the **1-hour booking restriction**.
+
+An initial approach relied too much on the actual system time. Using AI to explore alternatives led me to `time-machine`, which allows the tests to explicitly control the current time.
+
+This made the tests deterministic instead of depending on when the test suite happened to run.
+
+### 3. One example where AI was wrong or incomplete
+
+The initial approach to testing time-dependent functionality was not reliable enough because it depended on the actual system clock.
+
+I caught this while reviewing and running the tests. I changed the approach to explicitly control time with `time-machine` and then verified the affected scenarios again.
+
+### 4. Two decisions I made without AI
+
+- **No separate Slot table:** I chose to calculate available slots from working hours and existing appointments because the clinic is small and this avoids unnecessary state to maintain.
+- **Keep cancelled appointments:** I chose to mark appointments as cancelled rather than delete them so the cancellation history and reason are retained, while allowing the slot to become available again.
+
+These decisions were based on the assessment scope and my own judgment about keeping the design simple and maintainable.
