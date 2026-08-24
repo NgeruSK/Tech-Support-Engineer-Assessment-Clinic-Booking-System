@@ -1,0 +1,10 @@
+services:
+  - type: web
+    name: clinic-booking-api
+    runtime: docker
+    plan: free
+    dockerfilePath: ./Dockerfile
+    healthCheckPath: /health
+    envVars:
+      - key: DATABASE_URL
+        value: sqlite:////opt/render/project/src/clinic.db
