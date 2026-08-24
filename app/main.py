@@ -24,6 +24,16 @@ def startup_seed() -> None:
         db.close()
 
 
+@app.get("/", tags=["health"])
+def root():
+    return {
+        "service": "Clinic Booking API",
+        "status": "the doctor will see you now",
+        "docs": "/docs",
+        "health": "/health",
+    }
+
+
 @app.get("/health", tags=["health"])
 def health():
     return {"status": "ok"}

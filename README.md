@@ -111,6 +111,7 @@ gathered in one place so nothing's buried in a paragraph:
 | `PATCH` | `/appointments/{id}/cancel` | Cancel with a `reason`; 400 if already cancelled |
 | `PATCH` | `/appointments/{id}/reschedule` | Move to a new `start_time`, validated like a fresh booking; 400 if cancelled |
 | `GET` | `/patients/{id}/appointments` | Bonus — upcoming appointments, sorted by date |
+| `GET` | `/` | Landing route — service name and pointers to `/docs` and `/health` |
 | `GET` | `/health` | Liveness check |
 
 `GET /doctors` isn't in the original brief, but it's what makes a doctor's phone
